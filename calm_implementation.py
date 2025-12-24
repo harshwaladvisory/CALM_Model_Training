@@ -155,24 +155,24 @@ class CALMConfig:
 
 @dataclass
 class TrainingConfig:
-    """Training configuration"""
+    """Training configuration (Fixed for better convergence)"""
     # Autoencoder training
     ae_batch_size: int = 64  # Reduced for memory
     ae_learning_rate: float = 3e-4
     ae_num_steps: int = 5000  # Further reduced for testing
 
-    # CALM training
+    # CALM training - Fixed hyperparameters
     calm_batch_size: int = 16  # Reduced for memory
-    calm_learning_rate: float = 3e-4
+    calm_learning_rate: float = 1e-4  # Reduced from 3e-4 for stability
     calm_num_steps: int = 10000  # Reduced for testing
 
-    # Energy loss params
-    num_model_samples: int = 8  # N in paper
-    num_target_samples: int = 50  # Reduced M for memory
+    # Energy loss params - Adjusted for better training
+    num_model_samples: int = 16  # Increased from 8 for better diversity estimation
+    num_target_samples: int = 32  # Reduced but still effective
 
     # General
-    gradient_clip: float = 1.0
-    warmup_steps: int = 500
+    gradient_clip: float = 0.5  # Reduced from 1.0 for more stable gradients
+    warmup_steps: int = 1000  # Increased warmup
     save_every: int = 1000
     eval_every: int = 500
 
@@ -826,10 +826,11 @@ class RobustAutoencoder(nn.Module):
 
         return kl_loss
 
-# Cell 4: Energy-Based Generative Head
+# Cell 4: Energy-Based Generative Head (Fixed)
 class EnergyGenerativeHead(nn.Module):
     """
     Energy-based generative head for single-step continuous generation
+    Fixed version with better initialization and output normalization
     """
 
     def __init__(self, hidden_dim: int, latent_dim: int, noise_dim: int, num_blocks: int):
@@ -839,7 +840,7 @@ class EnergyGenerativeHead(nn.Module):
         self.noise_dim = noise_dim
         self.num_blocks = num_blocks
 
-        # Initial projections
+        # Initial projections with smaller initialization
         self.hidden_proj = nn.Linear(hidden_dim, hidden_dim)
         self.noise_proj = nn.Linear(noise_dim, hidden_dim)
 
@@ -850,6 +851,20 @@ class EnergyGenerativeHead(nn.Module):
 
         # Final projection to latent space
         self.output_proj = nn.Linear(hidden_dim, latent_dim)
+
+        # Output normalization layer
+        self.output_norm = nn.LayerNorm(latent_dim)
+
+        # Initialize weights for better training stability
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights with smaller values for stable training"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(self, hidden_state: torch.Tensor, num_samples: int = 1) -> torch.Tensor:
         """
@@ -862,8 +877,8 @@ class EnergyGenerativeHead(nn.Module):
         """
         batch_size = hidden_state.shape[0]
 
-        # Generate random noise
-        noise = torch.rand(batch_size, num_samples, self.noise_dim, device=hidden_state.device) - 0.5
+        # Generate random noise from standard normal (better than uniform)
+        noise = torch.randn(batch_size, num_samples, self.noise_dim, device=hidden_state.device)
 
         # Expand hidden state for multiple samples
         h = hidden_state.unsqueeze(1).expand(-1, num_samples, -1)
@@ -874,8 +889,8 @@ class EnergyGenerativeHead(nn.Module):
         noise_flat = noise.reshape(batch_size * num_samples, self.noise_dim)
         noise_proj = self.noise_proj(noise_flat)
 
-        # Initial combination
-        x = h_proj + noise_proj
+        # Initial combination with scaled noise
+        x = h_proj + 0.1 * noise_proj  # Scale noise to prevent dominating
 
         # Pass through residual blocks
         for block in self.blocks:
@@ -883,6 +898,9 @@ class EnergyGenerativeHead(nn.Module):
 
         # Final projection
         output = self.output_proj(x)
+
+        # Apply layer normalization for stable output distribution
+        output = self.output_norm(output)
 
         # Reshape to separate samples
         output = output.reshape(batch_size, num_samples, self.latent_dim)
@@ -1274,14 +1292,14 @@ class CALMModel(nn.Module):
 
         return generated_tokens
 
-# Cell 6: Energy Loss Implementation
+# Cell 6: Energy Loss Implementation (Fixed)
 def compute_energy_loss(predictions: torch.Tensor,
                         target_mus: torch.Tensor,
                         target_logvars: torch.Tensor,
                         num_target_samples: int = 100,
                         alpha: float = 1.0) -> torch.Tensor:
     """
-    Compute the energy loss for training CALM
+    Compute the energy loss for training CALM (Fixed version)
     Args:
         predictions: [batch, seq_len, num_model_samples, latent_dim]
         target_mus: [batch, seq_len, latent_dim]
@@ -1293,6 +1311,9 @@ def compute_energy_loss(predictions: torch.Tensor,
     """
     batch_size, seq_len, num_model_samples, latent_dim = predictions.shape
 
+    # Normalize predictions to have unit norm (critical for stable training)
+    predictions_normalized = F.normalize(predictions, p=2, dim=-1)
+
     # Sample targets from the posterior distribution
     target_samples = []
     for _ in range(num_target_samples):
@@ -1303,37 +1324,36 @@ def compute_energy_loss(predictions: torch.Tensor,
 
     target_samples = torch.stack(target_samples, dim=2)  # [batch, seq_len, M, latent_dim]
 
+    # Normalize targets as well
+    target_samples_normalized = F.normalize(target_samples, p=2, dim=-1)
+
     # Compute fidelity term: distance between predictions and targets
     # Expand dimensions for broadcasting
-    pred_expanded = predictions.unsqueeze(3)  # [batch, seq_len, N, 1, latent_dim]
-    target_expanded = target_samples.unsqueeze(2)  # [batch, seq_len, 1, M, latent_dim]
+    pred_expanded = predictions_normalized.unsqueeze(3)  # [batch, seq_len, N, 1, latent_dim]
+    target_expanded = target_samples_normalized.unsqueeze(2)  # [batch, seq_len, 1, M, latent_dim]
 
-    if alpha == 1.0:
-        distances = torch.abs(pred_expanded - target_expanded).sum(-1)  # L1 distance
-    else:
-        distances = torch.pow(torch.abs(pred_expanded - target_expanded).sum(-1), alpha)
+    # Use L2 distance (squared) for smoother gradients, normalized by latent_dim
+    distances = ((pred_expanded - target_expanded) ** 2).sum(-1) / latent_dim  # [batch, seq_len, N, M]
 
     fidelity = distances.mean()  # Average over all pairs
 
     # Compute diversity term: distance between prediction pairs
-    pred1 = predictions.unsqueeze(3)  # [batch, seq_len, N, 1, latent_dim]
-    pred2 = predictions.unsqueeze(2)  # [batch, seq_len, 1, N, latent_dim]
+    pred1 = predictions_normalized.unsqueeze(3)  # [batch, seq_len, N, 1, latent_dim]
+    pred2 = predictions_normalized.unsqueeze(2)  # [batch, seq_len, 1, N, latent_dim]
 
-    if alpha == 1.0:
-        pred_distances = torch.abs(pred1 - pred2).sum(-1)  # [batch, seq_len, N, N]
-    else:
-        pred_distances = torch.pow(torch.abs(pred1 - pred2).sum(-1), alpha)
+    pred_distances = ((pred1 - pred2) ** 2).sum(-1) / latent_dim  # [batch, seq_len, N, N]
 
     # Mask diagonal (distance to self)
     mask = torch.eye(num_model_samples, device=predictions.device).bool()
     pred_distances = pred_distances.masked_fill(mask, 0)
 
     # Sum over non-diagonal elements
-    diversity = pred_distances.sum(dim=(2, 3)) / (num_model_samples * (num_model_samples - 1))
+    diversity = pred_distances.sum(dim=(2, 3)) / (num_model_samples * (num_model_samples - 1) + 1e-8)
     diversity = diversity.mean()
 
-    # Energy loss
-    energy_loss = 2 * fidelity - diversity
+    # Energy loss: fidelity should be low, diversity should be high
+    # The coefficient balances the two terms
+    energy_loss = fidelity - 0.5 * diversity
 
     return energy_loss
 
@@ -1876,24 +1896,29 @@ def train_calm(
     config: TrainingConfig,
     device: torch.device
 ):
-    """Train the CALM model"""
+    """Train the CALM model (Fixed version with better training dynamics)"""
     model.to(device)
     model.train()
 
     optimizer = optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=config.calm_learning_rate,
-        weight_decay=0.1
+        weight_decay=0.01,  # Reduced weight decay
+        betas=(0.9, 0.98)  # Better for transformers
     )
 
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=config.warmup_steps,
-        T_mult=2
-    )
+    # Use linear warmup then cosine decay
+    def lr_lambda(step):
+        if step < config.warmup_steps:
+            return step / config.warmup_steps
+        progress = (step - config.warmup_steps) / (config.calm_num_steps - config.warmup_steps)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     step = 0
     losses = []
+    running_loss = 0.0
 
     # Evaluation metric
     brier_metric = BrierLMMetric()
@@ -1930,25 +1955,44 @@ def train_calm(
                 num_target_samples=config.num_target_samples
             )
 
+            # Check for None, NaN or Inf loss
+            if loss is None:
+                print(f"Warning: None loss at step {step}, skipping batch")
+                continue
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Warning: NaN/Inf loss at step {step}, skipping batch")
+                continue
+
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
+
+            # Gradient clipping
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad],
                 config.gradient_clip
             )
+
             optimizer.step()
             scheduler.step()
 
-            # Logging
-            losses.append(loss.item())
+            # Logging with exponential moving average
+            loss_val = loss.item()
+            running_loss = 0.99 * running_loss + 0.01 * loss_val if step > 0 else loss_val
+            losses.append(loss_val)
 
             step += 1
             pbar.update(1)
 
             if step % 100 == 0:
                 avg_loss = np.mean(losses[-100:])
-                pbar.set_postfix({'loss': f'{avg_loss:.4f}'})
+                current_lr = scheduler.get_last_lr()[0]
+                pbar.set_postfix({
+                    'loss': f'{avg_loss:.4f}',
+                    'ema_loss': f'{running_loss:.4f}',
+                    'lr': f'{current_lr:.2e}',
+                    'grad': f'{grad_norm:.2f}'
+                })
 
             if step % config.eval_every == 0:
                 # Evaluation
@@ -1957,7 +2001,7 @@ def train_calm(
                     eval_batch = next(iter(dataloader)).to(device)
                     metrics = brier_metric.compute(model, eval_batch)
                     pbar.set_postfix({
-                        'loss': f'{avg_loss:.4f}',
+                        'loss': f'{running_loss:.4f}',
                         'brierlm': f'{metrics["brierlm"]:.2f}'
                     })
                 model.train()
